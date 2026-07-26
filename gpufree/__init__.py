@@ -1,7 +1,4 @@
-"""
-GPUFee.cn (算力自由) API Client
-===============================
-A comprehensive Python client for the gpufree.cn GPU cloud platform.
+"""GPUFee.cn (算力自由) API client.
 
 Usage as library::
 
@@ -18,20 +15,19 @@ Usage as CLI::
     gpufree instances
 """
 
-from gpufree.client import (
-    GPUFeeClient,
-    _b64url_decode,
-    _extract_client_id,
-    _yuan,
+__version__ = "0.2.0"
+
+from .client import (
     BASE_URL,
     DEFAULT_TOKEN_FILE,
+    GPUFeeClient,
+    TOKEN_REFRESH_LEEWAY,
 )
 
 __all__ = [
-    "GPUFeeClient",
-    "_b64url_decode",
-    "_extract_client_id",
-    "_yuan",
     "BASE_URL",
     "DEFAULT_TOKEN_FILE",
+    "GPUFeeClient",
+    "TOKEN_REFRESH_LEEWAY",
+    "__version__",
 ]

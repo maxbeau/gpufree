@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "gpufree"
+dynamic = ["version"]
+description = "Python client and CLI for gpufree.cn"
+readme = "README.md"
+requires-python = ">=3.10"
+authors = [
+  { name = "maxbeau" },
+]
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3 :: Only",
+]
+
+[project.scripts]
+gpufree = "gpufree.cli:main"
+
+[tool.setuptools.dynamic]
+version = { attr = "gpufree.__version__" }
+
+[tool.setuptools.packages.find]
+include = ["gpufree*"]

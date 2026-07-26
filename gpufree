@@ -1,9 +1,0 @@
-#!/usr/bin/env python3
-"""gpufree — GPUFee.cn CLI entry point.  See ``gpufree --help``."""
-import sys
-sys.path.insert(0, "/home/maxbeau")
-
-from gpufree.cli import main
-
-if __name__ == "__main__":
-    raise SystemExit(main())

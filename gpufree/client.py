@@ -6,10 +6,12 @@ Use ``_yuan()`` to format them as human-readable yuan strings.
 """
 
 import base64
+import concurrent.futures
 import json
 import os
 import sys
 import tempfile
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -28,18 +30,23 @@ REFRESH_ENDPOINT = f"{BASE_URL}/api/v1/user/token/refresh"
 _DEFAULT_CLIENT_ID = "2nT1FAzUbAaUVVmmtM9t8t3kfKq"
 
 _PACKAGE_DIR = Path(__file__).resolve().parent
-DEFAULT_TOKEN_FILE = _PACKAGE_DIR / "token-state.json"
+_CONFIG_HOME = Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config")
+DEFAULT_TOKEN_FILE = _CONFIG_HOME / "gpufree" / "token-state.json"
+_LEGACY_TOKEN_FILE = _PACKAGE_DIR.parent / "token-state.json"
 TOKEN_REFRESH_LEEWAY = 300
 
 
 # ---------------------------------------------------------------------------
-# JWT helpers (public so other modules can reuse them)
+# Internal helpers
 # ---------------------------------------------------------------------------
 def _b64url_decode(payload: str) -> dict:
     """Decode a base64url-encoded JWT payload (no signature verification)."""
-    padded = payload + "=" * (4 - len(payload) % 4)
+    padded = payload + "=" * (-len(payload) % 4)
     raw = base64.urlsafe_b64decode(padded)
-    return json.loads(raw)
+    decoded = json.loads(raw)
+    if not isinstance(decoded, dict):
+        raise ValueError("JWT payload must be a JSON object")
+    return decoded
 
 
 def _extract_client_id(state: dict) -> str | None:
@@ -78,10 +85,47 @@ def _extract_client_id(state: dict) -> str | None:
 
 
 def _yuan(cents: int | None) -> str:
-    """Convert balance cents to yuan string (e.g. 16571 → '165.71')."""
+    """Convert balance cents to yuan string (e.g. 16571 → '165.71').
+
+    No thousands separators — the output is meant to be machine-readable
+    (e.g. piped into ``jq``/``bc`` from cron scripts).
+    """
     if cents is None:
         return "?"
-    return f"{cents / 100:,.2f}"
+    sign = "-" if cents < 0 else ""
+    yuan, remainder = divmod(abs(cents), 100)
+    return f"{sign}{yuan}.{remainder:02d}"
+
+
+def _format_duration(seconds: int) -> str:
+    """Format a non-negative duration as days, hours, and minutes."""
+    days, remainder = divmod(max(seconds, 0), 86400)
+    hours, remainder = divmod(remainder, 3600)
+    minutes = remainder // 60
+    return f"{days}d {hours}h {minutes}m"
+
+
+def _atomic_write_json(path: Path, data: dict) -> None:
+    """Atomically write private JSON data with restrictive permissions."""
+    path = Path(path)
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    fd, tmpname = tempfile.mkstemp(
+        prefix=".gpufree-token-", dir=path.parent, text=True
+    )
+    tmppath = Path(tmpname)
+    try:
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fd = -1
+            json.dump(data, fh, ensure_ascii=True, indent=2)
+            fh.write("\n")
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmppath, path)
+    finally:
+        if fd >= 0:
+            os.close(fd)
+        tmppath.unlink(missing_ok=True)
 
 
 # ---------------------------------------------------------------------------
@@ -104,58 +148,79 @@ class GPUFeeClient:
 
     def __init__(
         self,
-        token_file: Path | None = None,
+        token_file: str | Path | None = None,
         client_id: str | None = None,
     ):
-        self.token_file = Path(token_file or DEFAULT_TOKEN_FILE)
+        use_default_token_file = (
+            token_file is None or Path(token_file) == DEFAULT_TOKEN_FILE
+        )
+        self.token_file = (
+            Path(token_file) if token_file is not None else DEFAULT_TOKEN_FILE
+        )
         self._state: dict = {}
         self._client_id: str | None = client_id
+        self._legacy_token_file = (
+            _LEGACY_TOKEN_FILE if use_default_token_file else None
+        )
+        self._refresh_lock = threading.Lock()
         self._load_state()
 
     # ---- client_id resolution ----------------------------------------------
     @property
     def client_id(self) -> str:
         """Resolve client_id: explicit arg > JWT extraction > hardcoded default."""
+        return self._resolve_client_id()[0]
+
+    @property
+    def client_id_source(self) -> str:
+        """Describe where the active client_id came from."""
+        return self._resolve_client_id()[1]
+
+    def _resolve_client_id(self) -> tuple[str, str]:
         if self._client_id:
-            return self._client_id
+            return self._client_id, "explicit argument"
         extracted = _extract_client_id(self._state)
         if extracted:
-            return extracted
-        return _DEFAULT_CLIENT_ID
+            return extracted, "stored JWT"
+        return _DEFAULT_CLIENT_ID, "built-in default"
 
     # ---- state persistence ------------------------------------------------
     def _load_state(self) -> None:
+        source = self.token_file
+        should_migrate = (
+            not source.exists()
+            and self._legacy_token_file is not None
+            and self._legacy_token_file.exists()
+        )
+        if should_migrate:
+            source = self._legacy_token_file
+
         try:
-            with self.token_file.open(encoding="utf-8") as fh:
+            with source.open(encoding="utf-8") as fh:
                 self._state = json.load(fh)
         except FileNotFoundError:
             self._state = {}
             return
-        except (OSError, json.JSONDecodeError) as exc:
+        except (OSError, json.JSONDecodeError, UnicodeDecodeError) as exc:
             raise RuntimeError(
-                f"Cannot read token state from {self.token_file}: {exc}"
+                f"Cannot read token state from {source}: {exc}"
             ) from exc
 
         if not isinstance(self._state, dict):
             raise RuntimeError(
-                f"Invalid token state in {self.token_file}. Run: gpufree login"
+                f"Invalid token state in {source}. Run: gpufree login"
             )
 
+        if should_migrate:
+            self._save_state()
+
     def _save_state(self) -> None:
-        fd, tmpname = tempfile.mkstemp(
-            prefix=".gpufree-token-", dir=self.token_file.parent, text=True
-        )
-        tmppath = Path(tmpname)
         try:
-            os.fchmod(fd, 0o600)
-            with os.fdopen(fd, "w", encoding="utf-8") as fh:
-                json.dump(self._state, fh, ensure_ascii=True, indent=2)
-                fh.write("\n")
-                fh.flush()
-                os.fsync(fh.fileno())
-            os.replace(tmppath, self.token_file)
-        finally:
-            tmppath.unlink(missing_ok=True)
+            _atomic_write_json(self.token_file, self._state)
+        except OSError as exc:
+            raise RuntimeError(
+                f"Cannot save token state to {self.token_file}: {exc}"
+            ) from exc
 
     # ---- token introspection -----------------------------------------------
     def _token_expiry(self, token_name: str = "access_token") -> tuple[int, int] | None:
@@ -165,7 +230,11 @@ class GPUFeeClient:
             return None
         try:
             claims = _b64url_decode(token.split(".")[1])
-            return (claims.get("exp", 0), claims.get("iat", 0))
+            exp = claims.get("exp")
+            iat = claims.get("iat", 0)
+            if not isinstance(exp, int) or not isinstance(iat, int):
+                return None
+            return exp, iat
         except Exception:
             return None
 
@@ -202,10 +271,13 @@ class GPUFeeClient:
             message = "A session token has expired; refresh before the next API call"
         elif session_remaining <= TOKEN_REFRESH_LEEWAY:
             status = "refresh_due"
-            message = "A session token is close to expiry and will be refreshed automatically"
+            message = (
+                "A session token is close to expiry and will be refreshed "
+                "automatically"
+            )
         else:
             status = "valid"
-            message = f"Session token valid for {session_remaining // 60}m"
+            message = f"Session token valid for {_format_duration(session_remaining)}"
         return {
             "status": status,
             "message": message,
@@ -216,13 +288,10 @@ class GPUFeeClient:
 
     def _refresh_due(self) -> bool:
         """Return whether a stored session JWT is close to expiry."""
-        now = int(time.time())
-        expiries = []
-        for token_name in ("access_token", "id_token"):
-            exp_info = self._token_expiry(token_name)
-            if exp_info:
-                expiries.append(exp_info[0])
-        return bool(expiries) and min(expiries) <= now + TOKEN_REFRESH_LEEWAY
+        return self.check_expiry()["status"] in {
+            "refresh_due",
+            "refresh_required",
+        }
 
     # ---- token management -------------------------------------------------
     @property
@@ -235,8 +304,18 @@ class GPUFeeClient:
 
     def refresh_token(self) -> dict:
         """Refresh browser-style auth cookies and persist rotated tokens."""
+        with self._refresh_lock:
+            return self._refresh_token_unlocked()
+
+    def _refresh_token_unlocked(self) -> dict:
+        """Refresh tokens while the caller holds ``_refresh_lock``."""
         access_token = self._state.get("access_token")
         refresh_token = self._state.get("refresh_token")
+        id_token_expiry = self._token_expiry("id_token")
+        stale_id_token = bool(
+            id_token_expiry
+            and id_token_expiry[0] <= int(time.time()) + TOKEN_REFRESH_LEEWAY
+        )
         if not refresh_token:
             raise RuntimeError(
                 "Token state does not contain a refresh_token. Run: gpufree login"
@@ -290,7 +369,7 @@ class GPUFeeClient:
 
         try:
             payload = json.loads(raw) if raw else {}
-        except json.JSONDecodeError as exc:
+        except (json.JSONDecodeError, UnicodeDecodeError) as exc:
             raise RuntimeError(
                 "Token refresh endpoint returned invalid JSON"
             ) from exc
@@ -298,7 +377,7 @@ class GPUFeeClient:
         if not isinstance(payload, dict):
             raise RuntimeError("Token refresh endpoint returned an invalid response")
 
-        if payload.get("code") != 200:
+        if str(payload.get("code")) != "200":
             detail = payload.get("msg") or payload.get("error") or "unknown error"
             raise RuntimeError(
                 f"Token refresh failed: {detail}. Run: gpufree login"
@@ -323,9 +402,35 @@ class GPUFeeClient:
                 "Run: gpufree login"
             )
 
+        # Avoid refreshing on every request when the endpoint omits a stale ID token.
+        if stale_id_token and "id_token" not in refreshed_tokens:
+            self._state.pop("id_token", None)
         self._state.update(refreshed_tokens)
         self._save_state()
         return self._state.copy()
+
+    def _ensure_access_token(self) -> str:
+        """Return a usable token, refreshing once when missing or close to expiry."""
+        if self.access_token and not self._refresh_due():
+            return self.access_token
+
+        with self._refresh_lock:
+            if not self.access_token or self._refresh_due():
+                self._refresh_token_unlocked()
+
+        access_token = self.access_token
+        if not access_token:
+            raise RuntimeError(
+                "Token refresh succeeded but no access_token is available. "
+                "Run: gpufree login"
+            )
+        return access_token
+
+    def _refresh_after_auth_failure(self, rejected_token: str) -> None:
+        """Refresh unless another thread already replaced the rejected token."""
+        with self._refresh_lock:
+            if self.access_token == rejected_token:
+                self._refresh_token_unlocked()
 
     # ---- HTTP helpers -----------------------------------------------------
     def _request(
@@ -339,10 +444,7 @@ class GPUFeeClient:
         timeout: int = 30,
     ) -> dict:
         """Make an authenticated API request with one auth-refresh retry."""
-        if retry_auth and self._refresh_due():
-            self.refresh_token()
-
-        access_token = self.access_token
+        access_token = self._ensure_access_token() if retry_auth else self.access_token
         if not access_token:
             raise RuntimeError(
                 "Token state does not contain an access_token. Run: gpufree login"
@@ -363,31 +465,9 @@ class GPUFeeClient:
         try:
             with urllib.request.urlopen(req, timeout=timeout) as resp:
                 raw = resp.read()
-                payload = json.loads(raw) if raw else {}
-
-                if (
-                    isinstance(payload, dict)
-                    and str(payload.get("code")) == "43003"
-                ):
-                    if retry_auth:
-                        self.refresh_token()
-                        return self._request(
-                            method,
-                            path,
-                            body,
-                            retry_auth=False,
-                            retry_network=retry_network,
-                            timeout=timeout,
-                        )
-                    raise RuntimeError(
-                        "API authentication failed after token refresh. "
-                        "Run: gpufree login"
-                    )
-
-                return payload
         except urllib.error.HTTPError as exc:
             if exc.code == 401 and retry_auth:
-                self.refresh_token()
+                self._refresh_after_auth_failure(access_token)
                 return self._request(
                     method,
                     path,
@@ -415,6 +495,7 @@ class GPUFeeClient:
                 or "timed out" in str(exc.reason).lower()
             )
             if method == "GET" and retry_network and is_timeout:
+                time.sleep(1)
                 return self._request(
                     method,
                     path,
@@ -424,6 +505,31 @@ class GPUFeeClient:
                     timeout=timeout,
                 )
             raise RuntimeError(f"API {path} unreachable: {exc.reason}") from exc
+
+        try:
+            payload = json.loads(raw) if raw else {}
+        except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+            raise RuntimeError(
+                f"API {method} {path} returned invalid JSON"
+            ) from exc
+
+        if isinstance(payload, dict) and str(payload.get("code")) == "43003":
+            if retry_auth:
+                self._refresh_after_auth_failure(access_token)
+                return self._request(
+                    method,
+                    path,
+                    body,
+                    retry_auth=False,
+                    retry_network=retry_network,
+                    timeout=timeout,
+                )
+            raise RuntimeError(
+                "API authentication failed after token refresh. "
+                "Run: gpufree login"
+            )
+
+        return payload
 
     def _get(self, path: str, *, timeout: int = 30) -> dict:
         return self._request("GET", path, timeout=timeout)
@@ -577,18 +683,31 @@ class GPUFeeClient:
         Returns raw data plus ``balance_summary`` (yuan-formatted) and
         ``instances_summary`` (key fields per instance).
         """
-        result: dict = {}
-        for label, method in [
+        calls = [
             ("user", self.get_userinfo),
             ("balance", self.get_balance_overview),
             ("instances", self.list_instances),
             ("dashboard", self.get_dashboard_instances),
             ("unread_messages", self.get_unread_count),
-        ]:
-            try:
-                result[label] = method()
-            except RuntimeError as exc:
-                result[label] = {"error": str(exc)}
+        ]
+        result: dict = {}
+
+        try:
+            self._ensure_access_token()
+        except RuntimeError as exc:
+            result.update({label: {"error": str(exc)} for label, _ in calls})
+        else:
+            with concurrent.futures.ThreadPoolExecutor(
+                max_workers=len(calls), thread_name_prefix="gpufree-status"
+            ) as executor:
+                futures = {
+                    label: executor.submit(method) for label, method in calls
+                }
+                for label, _ in calls:
+                    try:
+                        result[label] = futures[label].result()
+                    except RuntimeError as exc:
+                        result[label] = {"error": str(exc)}
 
         # Human-readable balance summary
         bal = result.get("balance", {})
@@ -606,19 +725,30 @@ class GPUFeeClient:
         if isinstance(inst, dict):
             inst_data = inst.get("data", {})
             if isinstance(inst_data, dict):
-                items = inst_data.get("dataList", [])
-                result["instances_summary"] = [
-                    {
-                        "name": i.get("nick_name", "?"),
-                        "gpu": i.get("product_name", "?"),
-                        "count": i.get("req_gpu_amount", 0),
-                        "dc": i.get("data_center_name", "?"),
-                        "jupyter": "running" if i.get("jupyter_status") == 1 else "stopped",
-                        "disk_root": i.get("local_disk_info", {}).get("root_fs_used_rate", "?"),
-                        "ssh": i.get("ssh_command", ""),
-                    }
-                    for i in items
-                ]
+                items = inst_data.get("dataList") or []
+                instances_summary = []
+                for item in items if isinstance(items, list) else []:
+                    if not isinstance(item, dict):
+                        continue
+                    disk_info = item.get("local_disk_info") or {}
+                    if not isinstance(disk_info, dict):
+                        disk_info = {}
+                    instances_summary.append(
+                        {
+                            "name": item.get("nick_name", "?"),
+                            "gpu": item.get("product_name", "?"),
+                            "count": item.get("req_gpu_amount", 0),
+                            "dc": item.get("data_center_name", "?"),
+                            "jupyter": (
+                                "running"
+                                if item.get("jupyter_status") == 1
+                                else "stopped"
+                            ),
+                            "disk_root": disk_info.get("root_fs_used_rate", "?"),
+                            "ssh": item.get("ssh_command", ""),
+                        }
+                    )
+                result["instances_summary"] = instances_summary
 
         return result
 
@@ -627,7 +757,7 @@ class GPUFeeClient:
     # =====================================================================
 
     @staticmethod
-    def login_interactive(token_file: Path) -> int:
+    def login_interactive(token_file: str | Path) -> int:
         """Guide the user to extract tokens from their browser and save them."""
         js_snippet = (
             "copy(JSON.stringify({"
@@ -649,9 +779,15 @@ class GPUFeeClient:
             "╚══════════════════════════════════════════════════════════════╝"
         )
         print()
-        print("  \033[1;33m┌─ Copy the line below into the browser Console ────────────┐\033[0m")
+        print(
+            "  \033[1;33m┌─ Copy the line below into the browser Console "
+            "────────────┐\033[0m"
+        )
         print(f"  \033[1;33m│\033[0m \033[1;37m{js_snippet}\033[0m")
-        print("  \033[1;33m└──────────────────────────────────────────────────────────┘\033[0m")
+        print(
+            "  \033[1;33m└──────────────────────────────────────────────────────────"
+            "┘\033[0m"
+        )
         print()
         try:
             raw = input("Paste token JSON here: ").strip()
@@ -663,6 +799,10 @@ class GPUFeeClient:
             data = json.loads(raw)
         except json.JSONDecodeError as exc:
             print(f"Error: invalid JSON: {exc}", file=sys.stderr)
+            return 1
+
+        if not isinstance(data, dict):
+            print("Error: token JSON must be an object", file=sys.stderr)
             return 1
 
         required = ["access_token", "refresh_token"]
@@ -677,23 +817,16 @@ class GPUFeeClient:
             "id_token": data.get("id_token", ""),
             "token_type": data.get("token_type", "Bearer"),
             "expires_in": data.get("expires_in", 604800),
-            "scope": data.get("scope", "openid profile offline_access email phone user_info"),
+            "scope": data.get(
+                "scope", "openid profile offline_access email phone user_info"
+            ),
         }
 
-        fd, tmpname = tempfile.mkstemp(
-            prefix=".gpufree-token-", dir=token_file.parent, text=True
-        )
-        tmppath = Path(tmpname)
         try:
-            os.fchmod(fd, 0o600)
-            with os.fdopen(fd, "w", encoding="utf-8") as fh:
-                json.dump(state, fh, ensure_ascii=True, indent=2)
-                fh.write("\n")
-                fh.flush()
-                os.fsync(fh.fileno())
-            os.replace(tmppath, token_file)
-        finally:
-            tmppath.unlink(missing_ok=True)
+            _atomic_write_json(Path(token_file), state)
+        except OSError as exc:
+            print(f"Error: cannot save token state: {exc}", file=sys.stderr)
+            return 1
 
         # Verify
         client = GPUFeeClient(token_file=token_file)

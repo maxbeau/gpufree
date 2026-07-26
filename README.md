@@ -1,141 +1,186 @@
-# gpufree — 算力自由 API Client
+# gpufree - 算力自由 API Client
 
-A Python client + CLI for [gpufree.cn](https://www.gpufree.cn), a GPU cloud
-platform. Handles authentication (cookie-based token refresh), account
-balance queries, instance listing, and product browsing.
+A Python client and CLI for [gpufree.cn](https://www.gpufree.cn). It handles
+browser-style token refresh, account balance queries, instance listing, and
+product browsing.
+
+## Installation
+
+Python 3.10 or newer is required. A virtual environment is the preferred
+development setup:
+
+```bash
+python3 -m venv .venv
+. .venv/bin/activate
+python3 -m pip install --editable .
+```
+
+For an isolated command available outside the checkout, use `pipx`:
+
+```bash
+pipx install .
+```
+
+On a PEP 668-managed system where neither `pipx` nor the `venv` module is
+available, a user-site-only fallback is:
+
+```bash
+python3 -m pip install --user --break-system-packages --no-deps --editable .
+```
+
+These commands create the `gpufree` executable through the entry point declared
+in `pyproject.toml`. For user-site installs, ensure the scripts directory,
+commonly `~/.local/bin`, is on `PATH`.
 
 ## Quick start
 
 ```bash
-# Show everything
+# Show balance, instances, user information, and dashboard data
 gpufree status
 
-# Balance only
+# Query individual resources
 gpufree balance
-
-# List your GPU instances
 gpufree instances
+gpufree instance-left-copy
 
-# Check when the current token expires
+# Inspect or refresh the current session
 gpufree check
-
-# Refresh browser-style auth tokens now
 gpufree refresh
 
-# Login (when the refresh token is no longer usable)
+# Login when the refresh token is unavailable or invalid
 gpufree login
+
+# Show the installed version
+gpufree --version
 ```
-
-## Installation
-
-The package lives at `~/gpufree/` and is already wired up:
-
-```bash
-~/gpufree/gpufree                    # executable wrapper
-~/.local/bin/gpufree                 # symlink → ~/gpufree/gpufree
-```
-
-Add to `$PYTHONPATH` (or keep the ``sys.path`` hack in the wrapper) if you
-want to import the module from other scripts.
 
 ## Use as a Python library
 
 ```python
 from gpufree import GPUFeeClient
 
-client = GPUFeeClient()                     # uses ~/gpufree/token-state.json
-client = GPUFeeClient(token_file="...")     # custom token path
-client = GPUFeeClient(client_id="...")      # override reported client_id
+client = GPUFeeClient()                       # uses the XDG config directory
+client = GPUFeeClient(token_file="...")       # custom token path
+client = GPUFeeClient(client_id="...")        # override reported client_id
 
-# One-shot status (balance + instances + user)
 status = client.get_status()
-print(status["balance_summary"]["balance_yuan"])   # "165.71"
+print(status["balance_summary"]["balance_yuan"])  # "165.71"
 
-# Individual endpoints
-user   = client.get_userinfo()
-bal    = client.get_balance_overview()
-inst   = client.list_instances()
-prods  = client.get_hot_products()
+user = client.get_userinfo()
+balance = client.get_balance_overview()
+instances = client.list_instances()
+products = client.get_hot_products()
 ```
+
+`get_status()` fetches its five independent resources concurrently. It returns
+the raw responses together with machine-readable `balance_summary` strings and
+a compact `instances_summary`.
 
 ### Available API methods
 
-| Category   | Methods |
-|------------|---------|
-| **User**   | `get_userinfo()`, `get_unread_count()`, `get_messages()`, `get_invitation_code()` |
-| **Balance**| `get_balance()`, `get_balance_overview()`, `get_balance_history()`, `get_orders()`, `get_transactions()`, `get_daily_bills()`, `get_recharge_state()`, `get_vouchers()` |
-| **Instances** | `list_instances()`, `get_instance_status_tags()`, `get_instance_ide_res()`, `get_instance_left_copy()` |
-| **Dashboard** | `get_dashboard_instances()`, `get_dashboard_storage()` |
-| **Products** | `list_products()`, `get_hot_products()`, `list_gpu_names()`, `get_product_tags()`, `get_sku_price()` |
-| **Other**  | `list_ssh_keys()`, `list_file_storage()`, `list_public_images()` |
-| **Composite** | `get_status()` — returns `balance_summary` and `instances_summary` alongside raw data |
-| **Auth**   | `refresh_token()`, `check_expiry()`, `login_interactive()` |
+| Category | Methods |
+| --- | --- |
+| User | `get_userinfo()`, `get_unread_count()`, `get_messages()`, `get_invitation_code()` |
+| Balance | `get_balance()`, `get_balance_overview()`, `get_balance_history()`, `get_orders()`, `get_transactions()`, `get_daily_bills()`, `get_recharge_state()`, `get_vouchers()` |
+| Instances | `list_instances()`, `get_instance_status_tags()`, `get_instance_ide_res()`, `get_instance_left_copy()` |
+| Dashboard | `get_dashboard_instances()`, `get_dashboard_storage()` |
+| Products | `list_products()`, `get_hot_products()`, `list_gpu_names()`, `get_product_tags()`, `get_sku_price()` |
+| Other | `list_ssh_keys()`, `list_file_storage()`, `list_public_images()` |
+| Composite | `get_status()` |
+| Auth | `refresh_token()`, `check_expiry()`, `login_interactive()` |
 
 ## Token management
 
-Tokens are stored in `~/gpufree/token-state.json` (0600 permissions). The
-file contains:
+By default, tokens are stored with `0600` permissions at:
+
+```text
+$XDG_CONFIG_HOME/gpufree/token-state.json
+```
+
+When `XDG_CONFIG_HOME` is unset, the path is
+`~/.config/gpufree/token-state.json`. Use `--token-file PATH` or the
+`token_file` constructor argument to select another location.
+
+Upgrades from the original repository-local layout are automatic: if the new
+default file does not exist and `token-state.json` is found beside the project
+package, the client atomically copies it to the new location. The legacy file
+is left untouched so it can be removed after the migrated login is verified.
+
+The token state contains credentials similar to:
 
 ```json
 {
-  "access_token":  "<JWT — valid ~7 days>",
-  "refresh_token": "<browser cookie — used to refresh authentication>",
-  "id_token":      "<JWT — contains client_id for auto-extraction>",
-  "token_type":    "Bearer",
-  "expires_in":    604800,
-  "scope":         "openid profile offline_access email phone user_info"
+  "access_token": "<JWT, normally valid for about 7 days>",
+  "refresh_token": "<browser cookie used for authentication refresh>",
+  "id_token": "<JWT containing client_id metadata>",
+  "token_type": "Bearer",
+  "expires_in": 604800,
+  "scope": "openid profile offline_access email phone user_info"
 }
 ```
 
-- `gpufree check` — inspect both access_token and id_token expiry
-- `gpufree refresh` — refresh tokens immediately through the cookie endpoint
-- `gpufree login` — re-login when the refresh token is unavailable or invalid
-- `--token-file PATH` — use a custom token file location
-- `--client-id ID` — override the client_id reported by `gpufree client-id`
+- `gpufree check` inspects access-token and ID-token expiry.
+- `gpufree refresh` rotates tokens immediately through the cookie endpoint.
+- `gpufree login` obtains a new browser session interactively.
+- `gpufree client-id` reports the active client ID and its public source.
 
-Before a protected API call, the client refreshes the session when either JWT
-is within five minutes of expiry. It also attempts one refresh and retry when
-the server rejects authentication. If the refresh token is invalid, run
-`gpufree login` from a dedicated private browser window and close that window
-after copying the tokens so the browser cannot rotate the same refresh token.
+Before protected API calls, the client refreshes when either JWT is within five
+minutes of expiry. Concurrent requests share a refresh lock, so one rotated
+refresh token is not submitted multiple times. A 401 or API code 43003 triggers
+at most one refresh and request retry.
 
-### How client_id reporting works
+The OAuth client ID is resolved in this order:
 
-The OAuth `client_id` is resolved in this order:
+1. Explicit `client_id` constructor or `--client-id` CLI argument.
+2. The stored `id_token` or `access_token` JWT.
+3. The built-in client ID from the service's SPA registration.
 
-1. `--client-id` CLI argument (highest priority)
-2. Extracted from the stored `id_token` or `access_token` JWT
-3. Hardcoded default (`2nT1FAzUbAaUVVmmtM9t8t3kfKq`)
+Cookie-based token refresh does not use a client secret.
 
-Run `gpufree client-id` to see which source is active.
+## Automation and cron
 
-Cookie-based token refresh does not use `client_id` or `client_secret`.
-
-## Automation / cron
+Balance values contain no thousands separators, so they can be passed to tools
+such as `jq` and `bc`.
 
 ```bash
-# Add to crontab to check balance every hour
-0 * * * * /home/maxbeau/gpufree/gpufree status >> ~/gpufree-status.log 2>&1
+# Hourly status log
+0 * * * * $HOME/.local/bin/gpufree status >> $HOME/gpufree-status.log 2>&1
 
-# Alert when balance drops below ¥100 (using jq)
-*/30 * * * * BALANCE=$(/home/maxbeau/gpufree/gpufree status 2>/dev/null | jq -r '.balance_summary.balance_yuan') && [ "$(echo "$BALANCE < 100" | bc)" = 1 ] && echo "Low balance: ¥$BALANCE" | mail -s "GPUFee Alert" you@example.com
+# Alert when the balance drops below CNY 100
+*/30 * * * * STATUS=$($HOME/.local/bin/gpufree status 2>/dev/null) && BALANCE=$(echo "$STATUS" | jq -er '.balance_summary.balance_yuan | tonumber') && [ "$(echo "$BALANCE < 100" | bc)" = 1 ] && echo "Low balance: CNY $BALANCE" | mail -s "GPUFee Alert" you@example.com
 ```
 
-## Files
+## Development and tests
 
-```
-~/gpufree/
-├── README.md           # This file
-├── gpufree             # Executable wrapper
-├── __init__.py          # Package init — exports GPUFeeClient
-├── client.py            # GPUFeeClient class + auth helpers
-├── cli.py               # CLI argument parsing
-└── token-state.json     # Authentication tokens (0600, gitignored)
+The test suite uses only the Python standard library:
+
+```bash
+python3 -m unittest discover -s tests -v
 ```
 
-## Known limitations
+The tests cover proactive and concurrent refresh, missing access-token recovery,
+401 and 43003 retries, timeout backoff, invalid JSON, atomic token persistence,
+balance formatting, composite status concurrency, and CLI routing.
 
-- **Slide captcha** prevents fully automated login.  `gpufree login`
-  requires pasting tokens from the browser.
-- Automatic refresh is request-driven rather than scheduled. It runs before an
-  API call when either session JWT is within five minutes of expiry.
+```text
+gpufree/
+├── gpufree/
+│   ├── __init__.py
+│   ├── __main__.py
+│   ├── cli.py
+│   └── client.py
+├── tests/
+│   ├── __init__.py
+│   ├── test_cli.py
+│   └── test_client.py
+├── .gitignore
+├── pyproject.toml
+└── README.md
+```
+
+## Known limitation
+
+The service's slide captcha prevents fully automated login. `gpufree login`
+therefore requires copying token JSON from a dedicated private browser window.
+Close that window after copying the tokens so the browser does not rotate the
+same refresh token independently.

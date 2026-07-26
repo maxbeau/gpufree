@@ -5,13 +5,11 @@ CLI for gpufree.cn — see ``gpufree --help`` for available commands.
 import argparse
 import json
 import sys
+from collections.abc import Callable
 from pathlib import Path
 
-from gpufree.client import (
-    GPUFeeClient,
-    DEFAULT_TOKEN_FILE,
-    _extract_client_id,
-)
+from gpufree import __version__
+from gpufree.client import DEFAULT_TOKEN_FILE, GPUFeeClient
 
 
 def _print_json(obj: object) -> None:
@@ -37,6 +35,9 @@ def main() -> int:
         "--client-id", type=str, default=None,
         help="Override OAuth client_id (extracted from stored tokens by default)",
     )
+    parser.add_argument(
+        "--version", action="version", version=f"%(prog)s {__version__}"
+    )
 
     sub = parser.add_subparsers(dest="command", help="Sub-command")
 
@@ -57,6 +58,7 @@ def main() -> int:
     sub.add_parser("instances", help="List Jupyter/container instances")
     sub.add_parser("instance-tags", help="Instance status tags")
     sub.add_parser("instance-ide", help="Instance IDE resource info")
+    sub.add_parser("instance-left-copy", help="Remaining instance copy count")
 
     # Dashboard
     sub.add_parser("dashboard", help="Dashboard resource instances")
@@ -115,18 +117,12 @@ def main() -> int:
 
     if args.command == "client-id":
         print(f"client_id: {client.client_id}")
-        extracted = _extract_client_id(client._state)
-        if args.client_id:
-            print("source:     --client-id CLI argument")
-        elif extracted:
-            print("source:     extracted from stored JWT")
-        else:
-            print("source:     hardcoded default")
+        print(f"source:     {client.client_id_source}")
         return 0
 
     # ---- API commands ----
-    COMMANDS: dict[str, object] = {
-        "status": lambda: client.get_status(),
+    commands: dict[str, Callable[[], dict]] = {
+        "status": client.get_status,
         # Balance
         "balance": client.get_balance_overview,
         "balance-detail": client.get_balance,
@@ -140,6 +136,7 @@ def main() -> int:
         "instances": client.list_instances,
         "instance-tags": client.get_instance_status_tags,
         "instance-ide": client.get_instance_ide_res,
+        "instance-left-copy": client.get_instance_left_copy,
         # Dashboard
         "dashboard": client.get_dashboard_instances,
         "dashboard-storage": client.get_dashboard_storage,
@@ -160,7 +157,7 @@ def main() -> int:
         "images": client.list_public_images,
     }
 
-    handler = COMMANDS.get(args.command)
+    handler = commands.get(args.command)
     if handler is None:
         parser.print_help()
         return 1
