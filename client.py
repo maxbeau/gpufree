@@ -10,6 +10,7 @@ import json
 import os
 import sys
 import tempfile
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -28,6 +29,7 @@ _DEFAULT_CLIENT_ID = "2nT1FAzUbAaUVVmmtM9t8t3kfKq"
 
 _PACKAGE_DIR = Path(__file__).resolve().parent
 DEFAULT_TOKEN_FILE = _PACKAGE_DIR / "token-state.json"
+TOKEN_REFRESH_LEEWAY = 300
 
 
 # ---------------------------------------------------------------------------
@@ -156,9 +158,9 @@ class GPUFeeClient:
             tmppath.unlink(missing_ok=True)
 
     # ---- token introspection -----------------------------------------------
-    def _token_expiry(self) -> tuple[int, int] | None:
-        """Return (exp, iat) timestamps from access_token JWT, or None."""
-        token = self._state.get("access_token")
+    def _token_expiry(self, token_name: str = "access_token") -> tuple[int, int] | None:
+        """Return (exp, iat) timestamps from a stored JWT, or None."""
+        token = self._state.get(token_name)
         if not token:
             return None
         try:
@@ -168,30 +170,59 @@ class GPUFeeClient:
             return None
 
     def check_expiry(self) -> dict:
-        """Check token expiry status."""
-        import time
-        exp_info = self._token_expiry()
-        if not exp_info:
-            return {"status": "unknown", "message": "No access_token in state"}
-        exp_ts, _iat_ts = exp_info
+        """Report access and ID token expiry without contacting the server."""
         now = int(time.time())
-        remaining = exp_ts - now
-        if remaining <= 0:
-            return {
-                "status": "expired",
-                "message": f"Token expired {abs(remaining)}s ago. Run: gpufree login",
+        tokens = {}
+        for token_name in ("access_token", "id_token"):
+            exp_info = self._token_expiry(token_name)
+            if not exp_info:
+                tokens[token_name] = {"status": "missing_or_invalid"}
+                continue
+            exp_ts, iat_ts = exp_info
+            remaining = exp_ts - now
+            tokens[token_name] = {
+                "status": "valid" if remaining > 0 else "expired",
+                "issued_at": iat_ts,
                 "expires_at": exp_ts,
-                "now": now,
+                "lifetime_seconds": exp_ts - iat_ts,
+                "remaining_seconds": remaining,
             }
-        days = remaining // 86400
-        hours = (remaining % 86400) // 3600
+
+        usable_expiries = [
+            info["remaining_seconds"]
+            for info in tokens.values()
+            if "remaining_seconds" in info
+        ]
+        session_remaining = min(usable_expiries) if usable_expiries else None
+        if session_remaining is None:
+            status = "unknown"
+            message = "No valid JWT expiry information in token state"
+        elif session_remaining <= 0:
+            status = "refresh_required"
+            message = "A session token has expired; refresh before the next API call"
+        elif session_remaining <= TOKEN_REFRESH_LEEWAY:
+            status = "refresh_due"
+            message = "A session token is close to expiry and will be refreshed automatically"
+        else:
+            status = "valid"
+            message = f"Session token valid for {session_remaining // 60}m"
         return {
-            "status": "valid",
-            "message": f"Token valid for {days}d {hours}h",
-            "expires_at": exp_ts,
+            "status": status,
+            "message": message,
             "now": now,
-            "remaining_seconds": remaining,
+            "refresh_leeway_seconds": TOKEN_REFRESH_LEEWAY,
+            "tokens": tokens,
         }
+
+    def _refresh_due(self) -> bool:
+        """Return whether a stored session JWT is close to expiry."""
+        now = int(time.time())
+        expiries = []
+        for token_name in ("access_token", "id_token"):
+            exp_info = self._token_expiry(token_name)
+            if exp_info:
+                expiries.append(exp_info[0])
+        return bool(expiries) and min(expiries) <= now + TOKEN_REFRESH_LEEWAY
 
     # ---- token management -------------------------------------------------
     @property
@@ -214,6 +245,7 @@ class GPUFeeClient:
         cookie_values = {
             "access_token": access_token,
             "refresh_token": refresh_token,
+            "id_token": self._state.get("id_token"),
         }
         cookie_header = "; ".join(
             f"{name}={value}"
@@ -307,6 +339,9 @@ class GPUFeeClient:
         timeout: int = 30,
     ) -> dict:
         """Make an authenticated API request with one auth-refresh retry."""
+        if retry_auth and self._refresh_due():
+            self.refresh_token()
+
         access_token = self.access_token
         if not access_token:
             raise RuntimeError(
@@ -605,12 +640,12 @@ class GPUFeeClient:
             "╔══════════════════════════════════════════════════════════════╗\n"
             "║              GPUFee.cn  Interactive Login                    ║\n"
             "╠══════════════════════════════════════════════════════════════╣\n"
-            "║  1. Open https://www.gpufree.cn/login in your browser       ║\n"
+            "║  1. Open https://www.gpufree.cn/login in a private window  ║\n"
             "║  2. Log in with your phone number + password                ║\n"
             "║  3. Solve the slide captcha                                 ║\n"
             "║  4. Open DevTools (F12) → Console                           ║\n"
             "║  5. Paste the ONE-LINE script shown below and press Enter   ║\n"
-            "║  6. The JSON is now on your clipboard. Paste it below.      ║\n"
+            "║  6. Paste the copied JSON below, then close that window.    ║\n"
             "╚══════════════════════════════════════════════════════════════╝"
         )
         print()

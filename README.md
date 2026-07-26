@@ -87,15 +87,17 @@ file contains:
 }
 ```
 
-- `gpufree check` — see how long the current access_token is valid
+- `gpufree check` — inspect both access_token and id_token expiry
 - `gpufree refresh` — refresh tokens immediately through the cookie endpoint
 - `gpufree login` — re-login when the refresh token is unavailable or invalid
 - `--token-file PATH` — use a custom token file location
 - `--client-id ID` — override the client_id reported by `gpufree client-id`
 
-When a protected API reports an expired login, the client attempts one token
-refresh and retries the original request once. If the refresh token is also
-invalid, run `gpufree login`.
+Before a protected API call, the client refreshes the session when either JWT
+is within five minutes of expiry. It also attempts one refresh and retry when
+the server rejects authentication. If the refresh token is invalid, run
+`gpufree login` from a dedicated private browser window and close that window
+after copying the tokens so the browser cannot rotate the same refresh token.
 
 ### How client_id reporting works
 
@@ -135,5 +137,5 @@ Cookie-based token refresh does not use `client_id` or `client_secret`.
 
 - **Slide captcha** prevents fully automated login.  `gpufree login`
   requires pasting tokens from the browser.
-- Automatic refresh is request-driven rather than scheduled. It runs only
-  when an API reports that authentication has expired.
+- Automatic refresh is request-driven rather than scheduled. It runs before an
+  API call when either session JWT is within five minutes of expiry.

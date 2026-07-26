@@ -79,7 +79,7 @@ def main() -> int:
     sub.add_parser("ssh-keys", help="Registered SSH public keys")
     sub.add_parser("storage", help="File storage list")
     sub.add_parser("images", help="Public container images")
-    sub.add_parser("refresh", help="Refresh access token only")
+    sub.add_parser("refresh", help="Refresh session tokens now")
     sub.add_parser("client-id", help="Show the client_id currently in use")
     sub.add_parser("login", help="Interactive login — extract tokens from browser")
     sub.add_parser("check", help="Check token expiry status")
