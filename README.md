@@ -43,6 +43,10 @@ gpufree balance
 gpufree instances
 gpufree instance-left-copy
 
+# Manual control by ID, UUID, or exact name (omit selector for a sole instance)
+gpufree start my-instance --mode gpu --wait --wait-timeout 120
+gpufree stop my-instance --wait
+
 # Inspect or refresh the current session
 gpufree check
 gpufree refresh
@@ -75,6 +79,13 @@ products = client.get_hot_products()
 `get_status()` fetches its five independent resources concurrently. It returns
 the raw responses together with machine-readable `balance_summary` strings and
 a compact `instances_summary`.
+
+Manual control methods are `start_instance(id, uuid, start_mode="gpu")`,
+`stop_instance(id, uuid)`, `resolve_instance(selector)`, and
+`start_instance_by_selector()` / `stop_instance_by_selector()`. Start also accepts
+`start_mode="nogpu"`. Selector methods accept `wait=True` and `wait_timeout=120`;
+waiting polls every five seconds and returns
+`{"response": API_response, "instance": final_item}` instead of the raw response.
 
 ### Available API methods
 

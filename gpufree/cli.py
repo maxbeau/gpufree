@@ -60,6 +60,14 @@ def main() -> int:
     sub.add_parser("instance-ide", help="Instance IDE resource info")
     sub.add_parser("instance-left-copy", help="Remaining instance copy count")
 
+    for action in ("start", "stop"):
+        command = sub.add_parser(action, help=f"Manually {action} an instance")
+        command.add_argument("selector", nargs="?", help="Instance ID, UUID, or exact name")
+        command.add_argument("--wait", action="store_true")
+        command.add_argument("--wait-timeout", type=int, default=120)
+        if action == "start":
+            command.add_argument("--mode", choices=("gpu", "nogpu"), default="gpu")
+
     # Dashboard
     sub.add_parser("dashboard", help="Dashboard resource instances")
     sub.add_parser("dashboard-storage", help="Dashboard storage usage")
@@ -118,6 +126,20 @@ def main() -> int:
     if args.command == "client-id":
         print(f"client_id: {client.client_id}")
         print(f"source:     {client.client_id_source}")
+        return 0
+
+    if args.command in {"start", "stop"}:
+        try:
+            options = {"wait": args.wait, "wait_timeout": args.wait_timeout}
+            if args.command == "start":
+                result = client.start_instance_by_selector(args.selector, start_mode=args.mode, **options)
+            else:
+                result = client.stop_instance_by_selector(args.selector, **options)
+            print(f"{args.command} requested for {args.selector or 'the sole instance'}")
+            _print_json(result)
+        except (RuntimeError, ValueError) as exc:
+            print(f"Error: {exc}", file=sys.stderr)
+            return 1
         return 0
 
     # ---- API commands ----

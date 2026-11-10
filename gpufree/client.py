@@ -439,6 +439,7 @@ class GPUFeeClient:
         path: str,
         body: dict | None = None,
         *,
+        json_body: bool = False,
         retry_auth: bool = True,
         retry_network: bool = True,
         timeout: int = 30,
@@ -457,8 +458,10 @@ class GPUFeeClient:
         }
         data = None
         if body is not None:
-            data = urllib.parse.urlencode(body).encode("utf-8")
-            headers["Content-Type"] = "application/x-www-form-urlencoded"
+            data = (json.dumps(body) if json_body else urllib.parse.urlencode(body)).encode("utf-8")
+            headers["Content-Type"] = (
+                "application/json" if json_body else "application/x-www-form-urlencoded"
+            )
 
         req = urllib.request.Request(url, data=data, headers=headers, method=method)
 
@@ -472,6 +475,7 @@ class GPUFeeClient:
                     method,
                     path,
                     body,
+                    json_body=json_body,
                     retry_auth=False,
                     retry_network=retry_network,
                     timeout=timeout,
@@ -500,6 +504,7 @@ class GPUFeeClient:
                     method,
                     path,
                     body,
+                    json_body=json_body,
                     retry_auth=retry_auth,
                     retry_network=False,
                     timeout=timeout,
@@ -520,6 +525,7 @@ class GPUFeeClient:
                     method,
                     path,
                     body,
+                    json_body=json_body,
                     retry_auth=False,
                     retry_network=retry_network,
                     timeout=timeout,
@@ -600,6 +606,97 @@ class GPUFeeClient:
         return self._get(
             f"/api/v1/jupyter/list_instance_pages?{query}", timeout=15
         )
+
+    def start_instance(self, instance_id, instance_uuid, *, start_mode="gpu") -> dict:
+        """Request a manual start in GPU or CPU-only mode."""
+        if start_mode not in {"gpu", "nogpu"}:
+            raise ValueError("start_mode must be 'gpu' or 'nogpu'")
+        return self._request("PUT", "/api/v1/inferring-api/webide/", {
+            "instance_id": instance_id, "instance_uuid": instance_uuid,
+            "start_mode": start_mode, "action": "start",
+        }, json_body=True)
+
+    def stop_instance(self, instance_id, instance_uuid) -> dict:
+        """Request a manual stop."""
+        return self._request("PUT", "/api/v1/inferring-api/webide/", {
+            "instance_id": instance_id, "instance_uuid": instance_uuid,
+            "action": "stop",
+        }, json_body=True)
+
+    @staticmethod
+    def _instance_identifiers(item: dict) -> tuple:
+        return (item.get("instance_id") or item.get("webide_instance_id") or item.get("id"),
+                item.get("instance_uuid") or item.get("webide_instance_uuid") or item.get("uuid"))
+
+    def _instance_items(self) -> list[dict]:
+        response = self.list_instances()
+        data = response.get("data") if isinstance(response, dict) else None
+        items = data.get("dataList") if isinstance(data, dict) else None
+        return [item for item in items if isinstance(item, dict)] if isinstance(items, list) else []
+
+    def resolve_instance(self, selector: str | None) -> dict:
+        """Resolve by ID, UUID, exact name, or the sole instance."""
+        items = self._instance_items()
+        matches = items if selector is None else [
+            item for item in items
+            if selector in tuple(str(value) for value in self._instance_identifiers(item)
+                                 if value is not None) + tuple(
+                                     name for name in (item.get("nick_name"),
+                                                       item.get("webide_instance_name")) if name
+                                 )
+        ]
+        if len(matches) != 1:
+            candidates = "; ".join(
+                f"{item.get('nick_name', '?')} (id={self._instance_identifiers(item)[0]}, "
+                f"uuid={self._instance_identifiers(item)[1]})" for item in items
+            ) or "none"
+            raise RuntimeError(
+                f"Expected exactly one instance for selector {selector!r}; found {len(matches)}. "
+                f"Specify an ID, UUID, or exact name. Candidates: {candidates}"
+            )
+        item = matches[0]
+        if not all(self._instance_identifiers(item)):
+            raise RuntimeError("Instance lacks instance_id or instance_uuid; "
+                               f"present keys: {', '.join(sorted(item))}")
+        return item
+
+    def _wait_for_instance(self, item: dict, target: int, timeout: int) -> dict:
+        deadline = time.monotonic() + timeout
+        identifiers = self._instance_identifiers(item)
+        last_status = None
+        while True:
+            matches = [candidate for candidate in self._instance_items()
+                       if self._instance_identifiers(candidate) == identifiers]
+            if len(matches) == 1:
+                current = matches[0]
+                if "status" not in current:
+                    raise RuntimeError("Instance status field is unavailable")
+                last_status = current["status"]
+                if last_status == target:
+                    return current
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise RuntimeError(f"Timed out waiting for instance; last seen status: {last_status!r}")
+            time.sleep(min(5, remaining))
+
+    def start_instance_by_selector(self, selector=None, *, start_mode="gpu",
+                                   wait=False, wait_timeout=120) -> dict:
+        """Return API response; with wait return {'response': response, 'instance': final item}."""
+        if start_mode not in {"gpu", "nogpu"}:
+            raise ValueError("start_mode must be 'gpu' or 'nogpu'")
+        item = self.resolve_instance(selector)
+        response = self.start_instance(*self._instance_identifiers(item), start_mode=start_mode)
+        if wait:
+            return {"response": response, "instance": self._wait_for_instance(item, 3, wait_timeout)}
+        return response
+
+    def stop_instance_by_selector(self, selector=None, *, wait=False, wait_timeout=120) -> dict:
+        """Return API response; with wait return {'response': response, 'instance': final item}."""
+        item = self.resolve_instance(selector)
+        response = self.stop_instance(*self._instance_identifiers(item))
+        if wait:
+            return {"response": response, "instance": self._wait_for_instance(item, 5, wait_timeout)}
+        return response
 
     def get_instance_status_tags(self) -> dict:
         """Get status tags for instances."""

@@ -330,6 +330,140 @@ class RequestTests(ClientTestCase):
         sleep.assert_called_once_with(1)
 
 
+class InstanceControlTests(ClientTestCase):
+    item = {"instance_id": 12, "instance_uuid": "uuid-12", "nick_name": "worker"}
+    webide_item = {
+        "webide_instance_id": 12345,
+        "webide_instance_uuid": "fakeuuid-abcdef12",
+        "webide_instance_name": "jupyter-fakeuuid-abcdef12",
+        "nick_name": "",
+        "status": 5,
+        "charge_type": 0,
+        "product_name": "test-product",
+        "data_center_id": 1,
+    }
+
+    def test_webide_resolution(self):
+        client = self.make_client({})
+        with patch.object(client, "list_instances", return_value={
+            "data": {"dataList": [self.webide_item]}
+        }):
+            for selector in (None, "12345", "fakeuuid-abcdef12", "jupyter-fakeuuid-abcdef12"):
+                with self.subTest(selector=selector):
+                    self.assertEqual(client.resolve_instance(selector), self.webide_item)
+            with self.assertRaisesRegex(RuntimeError, "found 0"):
+                client.resolve_instance("")
+
+    def test_webide_start_stop_by_selector(self):
+        client = self.make_client({"access_token": "fake"})
+        for action in ("start", "stop"):
+            for selector in ("12345", "fakeuuid-abcdef12", "jupyter-fakeuuid-abcdef12"):
+                with self.subTest(action=action, selector=selector), patch.object(
+                    client, "list_instances", return_value={"data": {"dataList": [self.webide_item]}}
+                ), patch("gpufree.client.urllib.request.urlopen", return_value=FakeResponse()) as urlopen:
+                    getattr(client, action + "_instance_by_selector")(selector)
+                    req = urlopen.call_args.args[0]
+                    self.assertEqual(req.method, "PUT")
+                    body = json.loads(req.data)
+                    expected = {"instance_id": 12345, "instance_uuid": "fakeuuid-abcdef12",
+                                "action": action}
+                    if action == "start":
+                        expected["start_mode"] = "gpu"
+                    self.assertEqual(body, expected)
+                    self.assertIs(type(body["instance_id"]), int)
+
+    def test_json_requests_and_form_default(self):
+        client = self.make_client({"access_token": "fake"})
+        for action, mode in (("start", "gpu"), ("start", "nogpu"), ("stop", None)):
+            with self.subTest(action=action, mode=mode), patch(
+                "gpufree.client.urllib.request.urlopen", return_value=FakeResponse()
+            ) as urlopen:
+                if action == "start":
+                    client.start_instance(12, "uuid-12", start_mode=mode)
+                else:
+                    client.stop_instance(12, "uuid-12")
+                req = urlopen.call_args.args[0]
+                self.assertEqual(req.method, "PUT")
+                self.assertEqual(req.full_url, "https://www.gpufree.cn/api/v1/inferring-api/webide/")
+                self.assertEqual(req.get_header("Content-type"), "application/json")
+                expected = {"instance_id": 12, "instance_uuid": "uuid-12", "action": action}
+                if mode:
+                    expected["start_mode"] = mode
+                self.assertEqual(json.loads(req.data), expected)
+        with patch("gpufree.client.urllib.request.urlopen", return_value=FakeResponse()) as urlopen:
+            client._request("POST", "/fake", {"a": "b c"})
+        self.assertEqual(urlopen.call_args.args[0].data, b"a=b+c")
+        self.assertEqual(urlopen.call_args.args[0].get_header("Content-type"),
+                         "application/x-www-form-urlencoded")
+
+    def test_invalid_start_mode(self):
+        client = self.make_client({})
+        with patch.object(client, "list_instances") as listing:
+            for method, args in ((client.start_instance, (12, "uuid")),
+                                 (client.start_instance_by_selector, ())):
+                with self.assertRaises(ValueError):
+                    method(*args, start_mode="invalid")
+            listing.assert_not_called()
+
+    def test_resolution(self):
+        client = self.make_client({})
+        for item in (self.item, {"id": 12, "uuid": "uuid-12", "nick_name": "worker"}):
+            with patch.object(client, "list_instances", return_value={"data": {"dataList": [item]}}):
+                for selector in (None, "12", "uuid-12", "worker"):
+                    with self.subTest(item=item, selector=selector):
+                        self.assertEqual(client.resolve_instance(selector), item)
+                with self.assertRaisesRegex(RuntimeError, "Candidates: worker.*12.*uuid-12"):
+                    client.resolve_instance("missing")
+
+    def test_resolution_errors_and_odd_shapes(self):
+        client = self.make_client({})
+        for response in ({}, None, {"data": None}, {"data": {"dataList": "bad"}},
+                         {"data": {"dataList": [None, 42]}},
+                         {"data": {"dataList": [self.item, self.item]}}):
+            with self.subTest(response=response), patch.object(client, "list_instances", return_value=response):
+                with self.assertRaisesRegex(RuntimeError, "Candidates:"):
+                    client.resolve_instance(None)
+        with patch.object(client, "list_instances", return_value={"data": {"dataList": [self.item, self.item]}}):
+            with self.assertRaisesRegex(RuntimeError, "found 2"):
+                client.resolve_instance("worker")
+        with patch.object(client, "list_instances", return_value={"data": {"dataList": [{"id": 12, "nick_name": "worker"}]}}):
+            with self.assertRaisesRegex(RuntimeError, "present keys: id, nick_name"):
+                client.resolve_instance(None)
+
+    def test_wait_transitions(self):
+        client = self.make_client({})
+        for action, target in (("start", 3), ("stop", 5)):
+            final = dict(self.item, status=target)
+            responses = [{"data": {"dataList": [item]}} for item in
+                         (self.item, dict(self.item, status=1), final)]
+            with self.subTest(action=action), patch.object(client, "list_instances", side_effect=responses), patch.object(
+                client, action + "_instance", return_value={"code": 200}
+            ) as request, patch("gpufree.client.time.sleep") as sleep:
+                result = getattr(client, action + "_instance_by_selector")(wait=True)
+                self.assertEqual(result, {"response": {"code": 200}, "instance": final})
+                sleep.assert_called_once_with(5)
+                self.assertEqual(request.call_args.args, (12, "uuid-12"))
+
+    def test_wait_timeout_and_unavailable_status(self):
+        client = self.make_client({})
+        for status, error in (({"status": 7}, "last seen status: 7"), ({}, "status field is unavailable")):
+            with self.subTest(status=status), patch.object(client, "list_instances", return_value={
+                "data": {"dataList": [dict(self.item, **status)]}
+            }), patch.object(client, "stop_instance", return_value={}), patch("gpufree.client.time.sleep") as sleep:
+                with self.assertRaisesRegex(RuntimeError, error):
+                    client.stop_instance_by_selector(wait=True, wait_timeout=0)
+                sleep.assert_not_called()
+
+    def test_no_wait_returns_raw_response(self):
+        client = self.make_client({})
+        for action in ("start", "stop"):
+            with patch.object(client, "resolve_instance", return_value=self.item), patch.object(
+                client, action + "_instance", return_value={"code": 200}
+            ), patch.object(client, "_wait_for_instance") as wait:
+                self.assertEqual(getattr(client, action + "_instance_by_selector")(), {"code": 200})
+                wait.assert_not_called()
+
+
 class RefreshTests(ClientTestCase):
     def test_refresh_accepts_string_success_code(self):
         client = self.make_client({"refresh_token": "old-refresh"})
