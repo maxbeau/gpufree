@@ -31,7 +31,7 @@ def jwt(iat: int, exp: int, **claims: object) -> str:
 class FakeResponse:
     def __init__(
         self,
-        body: bytes = b"{}",
+        body: bytes = b'{"code": 200}',
         *,
         cookies: tuple[str, ...] = (),
         events: list[str] | None = None,

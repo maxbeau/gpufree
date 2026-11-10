@@ -128,6 +128,33 @@ def _atomic_write_json(path: Path, data: dict) -> None:
         tmppath.unlink(missing_ok=True)
 
 
+def status_text(status) -> str:
+    """Chinese instance status, preserving unknown platform values."""
+    return {"1": "排队中", "3": "运行中", "5": "已关机"}.get(str(status), str(status))
+
+
+class PlatformError(RuntimeError):
+    """A failed instance control request, with the original platform details."""
+
+    def __init__(self, code, msg):
+        self.code = code
+        self.msg = msg
+        hint = {
+            "53522": "源实例需处于关机状态；克隆前请先 stop 源实例",
+            "53523": "该机房 GPU 资源不足；请查 gpufree stock、改 --mode nogpu、或在网页克隆/新建实例",
+            "53524": "当前状态无法执行该操作；请先用 gpufree instances 确认状态",
+            "42408": "余额不足，请先充值",
+        }.get(str(code), "")
+        super().__init__(f"Platform code {code}: {msg}" + (f"；{hint}" if hint else ""))
+
+
+def _check_response(response: dict) -> dict:
+    """Preserve control responses on success and platform details on failure."""
+    if str(response.get("code")) != "200":
+        raise PlatformError(response.get("code"), response.get("msg", ""))
+    return response
+
+
 # ---------------------------------------------------------------------------
 # API Client
 # ---------------------------------------------------------------------------
@@ -611,17 +638,71 @@ class GPUFeeClient:
         """Request a manual start in GPU or CPU-only mode."""
         if start_mode not in {"gpu", "nogpu"}:
             raise ValueError("start_mode must be 'gpu' or 'nogpu'")
-        return self._request("PUT", "/api/v1/inferring-api/webide/", {
+        response = self._request("PUT", "/api/v1/inferring-api/webide/", {
             "instance_id": instance_id, "instance_uuid": instance_uuid,
             "start_mode": start_mode, "action": "start",
         }, json_body=True)
+        return _check_response(response)
 
     def stop_instance(self, instance_id, instance_uuid) -> dict:
         """Request a manual stop."""
-        return self._request("PUT", "/api/v1/inferring-api/webide/", {
+        response = self._request("PUT", "/api/v1/inferring-api/webide/", {
             "instance_id": instance_id, "instance_uuid": instance_uuid,
             "action": "stop",
         }, json_body=True)
+        return _check_response(response)
+
+    def create_instance(self, *, product_sku_code, data_center_id, image_id,
+                        charge_type=0, req_amount=1, start_model="gpu",
+                        expand_data_disk_gb=0, duration_type="", duration_count=1) -> dict:
+        """Create an instance; disk expansion assumes GiB, matching SPA GB2Bytes."""
+        if start_model not in ("gpu", "nogpu"):
+            raise ValueError("start_model must be 'gpu' or 'nogpu'")
+        if charge_type not in (0, 1):
+            raise ValueError("charge_type must be 0 or 1")
+        if not isinstance(req_amount, (int, float)) or not req_amount >= 1:
+            raise ValueError("req_amount must be at least 1")
+        return _check_response(self._request("POST", "/api/v1/inferring-api/webide", {
+            "product_sku_code": product_sku_code, "data_center_id": data_center_id,
+            "image_id": image_id, "charge_type": charge_type, "req_amount": req_amount,
+            "start_model": start_model, "expand_data_disk": expand_data_disk_gb * 1024**3,
+            "duration_type": duration_type, "duration_count": duration_count,
+        }, json_body=True))
+
+    def clone_instance_by_selector(self, selector=None, *, nickname=None,
+                                   clone_data=False, charge_type=0, expand_data_disk_gb=0,
+                                   duration_type="day", duration_count=1,
+                                   product_sku_code=None, data_center_id=None,
+                                   req_amount=None) -> dict:
+        """Clone a stopped source after checking the available clone quota."""
+        item = self.resolve_instance(selector)
+        if str(item.get("status")) != "5":
+            raise RuntimeError("源实例需处于关机状态；克隆前请先 stop 源实例")
+        quota = self.get_instance_left_copy().get("data")
+        remaining = quota.get("clone_count_left") if isinstance(quota, dict) else None
+        if remaining is not None and remaining <= 0:
+            raise RuntimeError("克隆配额不足：clone_count_left <= 0")
+        instance_id, instance_uuid = self._instance_identifiers(item)
+        return _check_response(self._request("PATCH", "/api/v1/inferring-api/webide/", {
+            "nickname": nickname if nickname is not None else f"{item.get('nick_name') or instance_uuid} 副本",
+            "charge_type": charge_type, "clone_data": int(bool(clone_data)),
+            "data_center_id": item.get("data_center_id") if data_center_id is None else data_center_id,
+            "duration_count": duration_count, "duration_type": duration_type,
+            "expand_data_disk": expand_data_disk_gb * 1024**3,
+            "product_sku_code": item.get("product_sku_code") if product_sku_code is None else product_sku_code,
+            "req_amount": item.get("req_amount", item.get("req_gpu_amount")) if req_amount is None else req_amount,
+            "source_webide_id": instance_id,
+        }, json_body=True))
+
+    def release_instance(self, instance_id, instance_uuid) -> dict:
+        """Release an instance. Callers must obtain their own confirmation."""
+        return _check_response(self._request("DELETE", "/api/v1/inferring-api/webide/", {
+            "instance_id": instance_id, "instance_uuid": instance_uuid,
+        }, json_body=True))
+
+    def release_instance_by_selector(self, selector=None) -> dict:
+        """Resolve and release an instance without interactive confirmation."""
+        return self.release_instance(*self._instance_identifiers(self.resolve_instance(selector)))
 
     @staticmethod
     def _instance_identifiers(item: dict) -> tuple:
@@ -660,24 +741,75 @@ class GPUFeeClient:
                                f"present keys: {', '.join(sorted(item))}")
         return item
 
-    def _wait_for_instance(self, item: dict, target: int, timeout: int) -> dict:
-        deadline = time.monotonic() + timeout
+    def _wait_for_instance(self, item: dict, target: int, timeout: int,
+                           *, interval=5, progress=None, unlimited=False) -> dict:
+        if interval <= 0 or timeout < 0:
+            raise ValueError("interval must be positive and timeout non-negative")
+        deadline = None if unlimited and timeout == 0 else time.monotonic() + timeout
         identifiers = self._instance_identifiers(item)
-        last_status = None
+        previous = object()
         while True:
             matches = [candidate for candidate in self._instance_items()
                        if self._instance_identifiers(candidate) == identifiers]
-            if len(matches) == 1:
-                current = matches[0]
-                if "status" not in current:
-                    raise RuntimeError("Instance status field is unavailable")
-                last_status = current["status"]
-                if last_status == target:
-                    return current
+            if len(matches) != 1:
+                raise RuntimeError("Instance disappeared from the instance list")
+            current = matches[0]
+            if "status" not in current:
+                raise RuntimeError("Instance status field is unavailable")
+            last_status = current["status"]
+            if last_status != previous and progress is not None:
+                progress(last_status)
+            previous = last_status
+            if str(last_status) == str(target):
+                return current
+            remaining = None if deadline is None else deadline - time.monotonic()
+            if remaining is not None and remaining <= 0:
+                raise RuntimeError(f"Timed out waiting for instance; last seen status: {last_status!r}")
+            time.sleep(interval if remaining is None else min(interval, remaining))
+
+    def watch_instance(self, selector=None, *, until="running", interval=10,
+                       timeout=0, progress=None) -> dict:
+        if until not in {"running", "stopped"}:
+            raise ValueError("until must be running or stopped")
+        return self._wait_for_instance(
+            self.resolve_instance(selector), 3 if until == "running" else 5,
+            timeout, interval=interval, progress=progress, unlimited=True)
+
+    @staticmethod
+    def product_stock(product: dict) -> tuple[int, list[tuple]]:
+        details = [(sku.get("datacenter_id"), int(sku.get("gpu_nodes_left") or 0))
+                   for sku in product.get("product_skus", [])]
+        return sum(left for _, left in details), details
+
+    def stock_products(self, query=None, *, available=False) -> list[dict]:
+        products = self.list_products().get("data") or []
+        return [product for product in products
+                if (not query or query.casefold() in product.get("product_name", "").casefold())
+                and (not available or self.product_stock(product)[0] > 0)]
+
+    def gpu_stock_for_instance(self, item: dict) -> int:
+        name = item.get("product_name")
+        if not name:
+            raise RuntimeError("Instance product_name is unavailable for stock lookup")
+        products = [product for product in self.stock_products()
+                    if product.get("product_name", "").casefold() == name.casefold()]
+        if not products:
+            raise RuntimeError(f"No stock product matches {name!r}")
+        details = [detail for product in products for detail in self.product_stock(product)[1]]
+        dc = item.get("data_center_id")
+        local = [left for key, left in details if dc is not None and str(key) == str(dc)]
+        return sum(local) if local else sum(left for _, left in details)
+
+    def wait_for_gpu_stock(self, item: dict, timeout=120) -> bool:
+        if timeout < 0:
+            raise ValueError("timeout must be non-negative")
+        deadline = time.monotonic() + timeout
+        while self.gpu_stock_for_instance(item) <= 0:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
-                raise RuntimeError(f"Timed out waiting for instance; last seen status: {last_status!r}")
-            time.sleep(min(5, remaining))
+                return False
+            time.sleep(min(30, remaining))
+        return True
 
     def start_instance_by_selector(self, selector=None, *, start_mode="gpu",
                                    wait=False, wait_timeout=120) -> dict:
@@ -832,7 +964,11 @@ class GPUFeeClient:
                         disk_info = {}
                     instances_summary.append(
                         {
-                            "name": item.get("nick_name", "?"),
+                            "name": item.get("nick_name") or item.get("webide_instance_name", "?"),
+                            "status": item.get("status"),
+                            "status_text": status_text(item.get("status")),
+                            "start_mode": item.get("start_mode"),
+                            **({"release_time": item["release_time"]} if "release_time" in item else {}),
                             "gpu": item.get("product_name", "?"),
                             "count": item.get("req_gpu_amount", 0),
                             "dc": item.get("data_center_name", "?"),

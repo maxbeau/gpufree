@@ -21,6 +21,7 @@ from .client import (
     BASE_URL,
     DEFAULT_TOKEN_FILE,
     GPUFeeClient,
+    PlatformError,
     TOKEN_REFRESH_LEEWAY,
 )
 
@@ -28,6 +29,7 @@ __all__ = [
     "BASE_URL",
     "DEFAULT_TOKEN_FILE",
     "GPUFeeClient",
+    "PlatformError",
     "TOKEN_REFRESH_LEEWAY",
     "__version__",
 ]
