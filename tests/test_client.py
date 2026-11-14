@@ -1,6 +1,7 @@
 import base64
 import concurrent.futures
 import io
+import http.client
 import json
 import stat
 import tempfile
@@ -328,6 +329,28 @@ class RequestTests(ClientTestCase):
         self.assertEqual(result, {"ok": True})
         self.assertEqual(urlopen.call_count, 2)
         sleep.assert_called_once_with(1)
+
+    def test_get_retries_remote_disconnect_but_post_does_not(self):
+        client = self.make_client({"access_token": "opaque"})
+        with patch(
+            "gpufree.client.urllib.request.urlopen",
+            side_effect=[
+                urllib.error.URLError(http.client.RemoteDisconnected("closed")),
+                FakeResponse(b'{"ok": true}'),
+            ],
+        ) as urlopen, patch("gpufree.client.time.sleep") as sleep:
+            self.assertEqual(client._get("/test"), {"ok": True})
+        self.assertEqual(urlopen.call_count, 2)
+        sleep.assert_called_once_with(1)
+
+        with patch(
+            "gpufree.client.urllib.request.urlopen",
+            side_effect=urllib.error.URLError(http.client.RemoteDisconnected("closed")),
+        ) as urlopen, patch("gpufree.client.time.sleep") as sleep:
+            with self.assertRaisesRegex(RuntimeError, "unreachable"):
+                client._request("POST", "/test", {})
+        self.assertEqual(urlopen.call_count, 1)
+        sleep.assert_not_called()
 
 
 class InstanceControlTests(ClientTestCase):

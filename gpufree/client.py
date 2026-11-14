@@ -7,6 +7,8 @@ Use ``_yuan()`` to format them as human-readable yuan strings.
 
 import base64
 import concurrent.futures
+import fcntl
+import http.client
 import json
 import os
 import sys
@@ -109,6 +111,18 @@ def _atomic_write_json(path: Path, data: dict) -> None:
     """Atomically write private JSON data with restrictive permissions."""
     path = Path(path)
     path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    lock_path = path.with_name(path.name + ".lock")
+    lock_fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        fcntl.flock(lock_fd, fcntl.LOCK_EX)
+        _atomic_write_json_unlocked(path, data)
+    finally:
+        fcntl.flock(lock_fd, fcntl.LOCK_UN)
+        os.close(lock_fd)
+
+
+def _atomic_write_json_unlocked(path: Path, data: dict) -> None:
+    """Write implementation used while holding the adjacent flock."""
     fd, tmpname = tempfile.mkstemp(
         prefix=".gpufree-token-", dir=path.parent, text=True
     )
@@ -521,11 +535,12 @@ class GPUFeeClient:
                 f"API {method} {path} failed (HTTP {exc.code}): {detail}"
             ) from exc
         except urllib.error.URLError as exc:
-            is_timeout = (
-                isinstance(exc.reason, TimeoutError)
-                or "timed out" in str(exc.reason).lower()
+            reason = exc.reason
+            retryable_network_error = (
+                isinstance(reason, (ConnectionError, TimeoutError, http.client.HTTPException))
+                or "timed out" in str(reason).lower()
             )
-            if method == "GET" and retry_network and is_timeout:
+            if method == "GET" and retry_network and retryable_network_error:
                 time.sleep(1)
                 return self._request(
                     method,
@@ -536,7 +551,20 @@ class GPUFeeClient:
                     retry_network=False,
                     timeout=timeout,
                 )
-            raise RuntimeError(f"API {path} unreachable: {exc.reason}") from exc
+            raise RuntimeError(f"API {path} unreachable: {reason}") from exc
+        except (ConnectionError, TimeoutError, http.client.HTTPException) as exc:
+            if method == "GET" and retry_network:
+                time.sleep(1)
+                return self._request(
+                    method,
+                    path,
+                    body,
+                    json_body=json_body,
+                    retry_auth=retry_auth,
+                    retry_network=False,
+                    timeout=timeout,
+                )
+            raise RuntimeError(f"API {path} unreachable: {exc}") from exc
 
         try:
             payload = json.loads(raw) if raw else {}
